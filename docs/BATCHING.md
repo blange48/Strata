@@ -52,6 +52,29 @@ card, 4 from 32 GB or on a split such as 2 x 16 GB; IQ3_S needs 32 GB or a split
 card alone) it stays at one at a time and setup says: "parallel N reduces waiting for several users but costs
 about 10-25% speed per request on this card". `--parallel N` is honoured as asked either way.
 
+### Choosing the settings: `tools/autoconfig.py`
+
+```
+python3 tools/autoconfig.py --config strata-<model>.json               # rules from the machine, writes .auto.json
+python3 tools/autoconfig.py --config strata-<model>.json --calibrate   # + starts the engine with each candidate
+```
+
+It reads the GPUs (count, VRAM, PCIe link), the RAM and the model's layer count, and writes a copy of the config:
+
+- **Split**: one card, none; several, an explicit split with each card's share of the layers proportional to its
+  VRAM, and `--trim-stage-weights`. A card whose link runs narrower than it can (x8 of x16) is named: every
+  hand-off crosses it.
+- **Slots**: `"parallel": 2 x cards` (at most 8) and one pipeline group per card (`--batch-groups`);
+  `"parallel": 4` on one card - setup's own advice on one card (below) is the one to follow there.
+- **Context**: with KV streaming every sequence (the solo session and each slot) holds its K/V in pinned host
+  memory, ~263 bytes per layer per token (int8). The largest context whose K/V for all sequences stays under a
+  quarter of the RAM; if even 32K does not fit, fewer slots.
+- **Parking**: `--conversation-cache-mib` at 8 % of the RAM, 8 GiB at most.
+
+The rules come from a few machines. `--calibrate` measures the candidates (the rules, and the rules
+without pipeline groups) at 1 request (solo path), 2, 4 and all slots, and keeps the
+one with the best mean relative rate; each candidate is an engine start, so it takes several minutes per candidate.
+
 ## How the server uses the slots
 
 - **One request alone** runs on the usual solo path (verify windows with MTP drafts): the fastest single stream.
