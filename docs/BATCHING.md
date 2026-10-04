@@ -30,6 +30,7 @@ With a layer split, the engine options go into the config's `args`:
 | --- | --- |
 | `"parallel": N` / `--batch N` / `--slots N` (2..8) | up to N conversations decoded together; more requests wait for a free slot. Each slot gets its own state (a session carved like the stage's own: GDN recurrence, QSA K/V and indexer, PLE history) on every GPU of the split. |
 | `--batch-groups G` | with a layer split: the N slots in G groups that flow through the GPUs as a pipeline (GPU k runs one group while GPU k+1 runs another). G must divide N. 1 = all slots in one window, GPU after GPU. |
+| `--stage-threads` | with `--batch-groups`: one host thread per stage serves its windows (the per-layer doorbells and its share of the CPU experts) on its own slice of the CPU cores, instead of one thread serving every stage in turn, so a stage no longer waits for another stage's CPU work. Not used with `--peer-device`, `--expert-cache-remote`, a staged file tier or `--dump-routing`; the adaptive cache's swaps wait until every stage is idle. Experimental. |
 | `--trim-stage-weights` | with an **explicit** `--layer-split` (e.g. `12,24,36`, not `auto`): every GPU loads only the dense weights of its own layers instead of the whole model's (the same as `STRATA_STAGE_TRIM=1`, PR #639). The VRAM this frees goes to the expert cache. Useful without `--batch` too. |
 
 The engine never refuses a count it cannot run: it says so in its log and runs what it can - at most 8 slots (a
