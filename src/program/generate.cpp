@@ -460,6 +460,9 @@ struct Options {
     /// The --batch slots in this many groups pipelined through the stages of a layer split (stage k
     /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
     int batch_groups = 1;
+    /// --batch-groups: one host thread per stage serves its verify windows (its doorbells and its share of the CPU
+    /// experts, on its own slice of the cores), instead of one thread serving every stage in turn.
+    bool stage_threads = false;
     std::string spec_oracle;
     int spec_corrupt = 0;
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
@@ -623,6 +626,7 @@ void usage() {
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
+                 "  --stage-threads      --batch-groups: one host thread and one slice of the CPU cores per stage\n"
                  "  --trim-stage-weights an explicit --layer-split: each GPU loads only its own layers' dense weights\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
@@ -1397,6 +1401,7 @@ int main(int argc, char** argv) {
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--batch-groups") o.batch_groups = std::atoi(next("--batch-groups"));
+        else if (a == "--stage-threads") o.stage_threads = true;
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp") o.mtp = next("--mtp");
@@ -6107,6 +6112,85 @@ int main(int argc, char** argv) {
             for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) return true;
             return false;
         };
+        // ---- --stage-threads: one host thread per stage serves its windows - the per-layer doorbells and its share of
+        // the CPU experts - on its own pool (its own slice of the cores) and its own copy of the dispatch state, so the
+        // stages no longer wait for each other's CPU work.  The thread here only launches windows and hands groups on.
+        // A stage's thread runs only between its launch (state 1) and its result (2 / 3); everything it shares with
+        // the others is read-only meanwhile: the residency table and the source change only in apply_pending, which
+        // waits for every stage to be idle (below).
+        struct StagePoller {
+            std::thread th;
+            std::mutex mu;
+            std::condition_variable cv;
+            std::atomic<int> state{0};          ///< 0 idle, 1 a window launched (the thread polls it), 2 done, 3 error
+            std::atomic<bool> stop{false};
+            std::string err;
+            std::unique_ptr<strata::kernels::cpu::ExpertPool> pool;
+            Drive drive;                        ///< its own scratch, counters and usage; the pointers are shared
+            int64_t lb = 0, le = 0;             ///< its layers (its usage is folded back into the shared one)
+        };
+        std::vector<std::unique_ptr<StagePoller>> spoll;
+        if (piped && o.stage_threads) {
+            const char* why = peer.valid() ? "--peer-device"
+                            : drive.d.remote_count > 0 ? "--expert-cache-remote"
+                            : drive.d.lookahead != nullptr ? "the router lookahead"
+                            : (srcp == &src && src.staged()) ? "a staged expert file tier"
+                            : drive.routing != nullptr ? "--dump-routing" : nullptr;
+            if (why != nullptr) {
+                std::fprintf(stderr, "strata serve: --stage-threads is not used with %s: one thread serves the stages\n", why);
+            } else {
+                // each stage's thread drains with its pool (host_works), so a slice is its workers plus that thread
+                const int per = std::max(1, pool.workers() / n_pipe - 1);
+                for (int k = 0; k < n_pipe; ++k) {
+                    auto sp = std::make_unique<StagePoller>();
+                    sp->pool = std::make_unique<strata::kernels::cpu::ExpertPool>(per, true, !o.no_host_worker,
+                                                                                  o.pool_affinity, k * (per + 1));
+                    sp->drive = drive;
+                    sp->drive.routing = nullptr;
+                    sp->drive.d.pool = sp->pool.get();
+                    sp->drive.d.plan = split_drive.plan[k];
+                    sp->drive.d.cache_base = split_drive.cache_base[k];
+                    sp->drive.d.cache_slot_off = split_drive.cache_slot_off[k];
+                    sp->drive.d.pcie_num = split_drive.pcie_num[k];
+                    std::fill(sp->drive.d.usage.begin(), sp->drive.d.usage.end(), 0.0f);
+                    sp->lb = k == 0 ? 0 : split_drive.end[k - 1];
+                    sp->le = split_drive.end[k];
+                    spoll.push_back(std::move(sp));
+                }
+                for (int k = 0; k < n_pipe; ++k) {
+                    StagePoller* sp = spoll[(size_t) k].get();
+                    strata::core::Verifier* vk = &stage_verifier(k);
+                    sp->th = std::thread([sp, vk] {
+                        for (;;) {
+                            {
+                                std::unique_lock<std::mutex> lk(sp->mu);
+                                sp->cv.wait(lk, [sp] {
+                                    return sp->stop.load() || sp->state.load(std::memory_order_acquire) == 1;
+                                });
+                            }
+                            if (sp->stop.load()) return;
+                            int r = 0;
+                            while ((r = vk->batch_poll(&drive_pool_multi, &sp->drive, sp->err)) == 0 && !sp->stop.load())
+                                std::this_thread::yield();
+                            sp->state.store(r > 0 ? 2 : 3, std::memory_order_release);
+                        }
+                    });
+                }
+                std::fprintf(stderr, "strata serve: --stage-threads: %d stage threads, %d CPU workers each\n", n_pipe, per);
+            }
+        }
+        struct StageJoin {
+            std::vector<std::unique_ptr<StagePoller>>& v;
+            ~StageJoin() {
+                for (auto& p : v) {
+                    p->stop.store(true);
+                    { std::lock_guard<std::mutex> lk(p->mu); }
+                    p->cv.notify_all();
+                    if (p->th.joinable()) p->th.join();
+                }
+            }
+        } stage_join{spoll};
+        auto stages_idle = [&] { for (int x : stage_group) if (x >= 0) return false; return true; };
         // one turn: serve every running stage, hand finished groups on, start what can start
         auto pump = [&](bool may_start) -> bool {
             ++pipe_tick;
@@ -6119,7 +6203,25 @@ int main(int argc, char** argv) {
                 const int gi = stage_group[(size_t) k];
                 if (gi < 0) continue;
                 strata::core::Verifier& vk = stage_verifier(k);
-                const int r = vk.batch_poll(win_pool_fn, win_pool_user, err);
+                int r = 0;
+                if (!spoll.empty()) {   // --stage-threads: the stage's own thread polled it
+                    StagePoller& sp = *spoll[(size_t) k];
+                    const int st = sp.state.load(std::memory_order_acquire);
+                    if (st == 1) continue;
+                    r = st == 2 ? 1 : -1;
+                    if (r < 0) err = sp.err;
+                    sp.state.store(0, std::memory_order_relaxed);
+                    std::vector<float>& u = drive.d.usage;   // its expert usage, back into the shared counts
+                    std::vector<float>& su = sp.drive.d.usage;
+                    if (!u.empty() && su.size() == u.size())
+                        for (size_t i = (size_t) (sp.lb * g.n_expert); i < (size_t) (sp.le * g.n_expert); ++i) {
+                            u[i] += su[i];
+                            su[i] = 0.0f;
+                        }
+                    if (sp.drive.d.failed) { drive.d.failed = true; drive.d.fail = sp.drive.d.fail; }
+                } else {
+                    r = vk.batch_poll(win_pool_fn, win_pool_user, err);
+                }
                 if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
                 if (r == 0) continue;
                 stage_group[(size_t) k] = -1;
@@ -6184,15 +6286,23 @@ int main(int argc, char** argv) {
                     G.inflight = true;
                     G.stage = 0;
                     drive.d.failed = false;
-                    apply_pending(false);
+                    // --stage-threads: the swaps change what the stage threads read, so only with every stage idle
+                    if (spoll.empty() || stages_idle()) apply_pending(false);
                 }
                 PGroup& G = pg[(size_t) pick];
                 strata::core::progress().busy.store(true);
+                if (!spoll.empty())   // its thread is idle: this request's PCIe share
+                    spoll[(size_t) k]->drive.d.pcie_num = split_drive.pcie_num[k];
                 if (!stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
                 }
                 stage_group[(size_t) k] = pick;
+                if (!spoll.empty()) {
+                    StagePoller& sp = *spoll[(size_t) k];
+                    { std::lock_guard<std::mutex> lk(sp.mu); sp.state.store(1, std::memory_order_release); }
+                    sp.cv.notify_one();
+                }
             }
             if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
             if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
