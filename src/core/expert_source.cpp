@@ -856,6 +856,23 @@ void FileExpertSource::prefetch_pairs(const std::pair<int32_t, int32_t>* pairs, 
     fill_many(todo);
 }
 
+bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
+    if (base_ == nullptr || !direct_.empty() || !strata::platform::read_ahead_enabled()) return false;
+    for (int64_t i = 0; pairs != nullptr && i < n; ++i) {
+        const int64_t l = pairs[i].first, e = pairs[i].second;
+        if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
+        if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
+            if (const uint8_t* b = mapped_blob(l, e)) strata::platform::advise_willneed(b, layer_blob_bytes_[(size_t) l]);
+            continue;
+        }
+        for (int r = 0; r < 3; ++r) {
+            const size_t k = (size_t) (3 * l + r);
+            strata::platform::advise_willneed(role_ptr_[k] + (size_t) ((uint64_t) e * role_bytes_[k]), role_bytes_[k]);
+        }
+    }
+    return true;
+}
+
 void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
     if (todo.empty()) return;
     if (!direct_.empty()) {
@@ -1332,6 +1349,7 @@ bool FileExpertSource::pin_cache_complement(
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
     uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
     err.clear();
+    const auto pin_t0 = std::chrono::steady_clock::now();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
     if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
     if (!cache.valid()) { err = "FileExpertSource: the GPU expert cache is not open"; return false; }
@@ -1602,6 +1620,7 @@ bool FileExpertSource::pin_cache_complement(
     std::atomic<uint64_t> copied{0};
     std::atomic<bool> failed{false};
     std::mutex fail_mu;
+    const auto copy_t0 = std::chrono::steady_clock::now();
     std::string fail_msg;
     auto fail = [&](const std::string& m) {
         std::lock_guard<std::mutex> lock(fail_mu);
@@ -1623,6 +1642,13 @@ bool FileExpertSource::pin_cache_complement(
                 batch.clear();
                 return true;
             };
+            if (direct_.empty()) {   // mapped reads: ask for the layer's blobs before copying them
+                std::vector<std::pair<int32_t, int32_t>> ahead;
+                for (int64_t expert = 0; expert < n_expert_; ++expert)
+                    if (offsets[(size_t) layer * (size_t) n_expert_ + (size_t) expert] != kNoComplement)
+                        ahead.emplace_back((int32_t) layer, (int32_t) expert);
+                (void) advise_pairs(ahead.data(), (int64_t) ahead.size());
+            }
             for (int64_t expert = 0; expert < n_expert_; ++expert) {
                 const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
                 const uint64_t offset = offsets[index];
@@ -1673,8 +1699,9 @@ bool FileExpertSource::pin_cache_complement(
 #endif
             const int64_t done = layers_done.fetch_add(1) + 1;
             if (done % 8 == 0 || done == n_layers_)
-                std::fprintf(stderr, "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB)\n",
-                             (long long) done, (long long) n_layers_, (double) copied.load() / 1073741824.0);
+                std::fprintf(stderr, "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB, %.0f s)\n",
+                             (long long) done, (long long) n_layers_, (double) copied.load() / 1073741824.0,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count());
         }
     };
     {
@@ -1709,9 +1736,10 @@ bool FileExpertSource::pin_cache_complement(
     complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : 0;
     complement_ready_ = true;
-    std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB%s%s\n",
+    std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
                  (double) resident_bytes() / 1073741824.0, (double) pinned_bytes() / 1073741824.0,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_t0).count(),
                  note.empty() ? "" : "; ", note.c_str());
     if (lend)
         std::fprintf(stderr, "FileExpertSource: %lld of the prompt path's %lld lendable slots keep their experts in RAM "
