@@ -3615,7 +3615,7 @@ def make_handler(svc: Service):
 
         def _body(self) -> bytes:
             self.body_read = True
-            return self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            return self._read_body()
 
         def _drain_body(self):
             """An answer sent before the body was read (a 401, a 403, /load, a method with no handler) must not close
@@ -3904,6 +3904,39 @@ def make_handler(svc: Service):
                     self._json(200, svc.v1_status())
             else:
                 self._json(404, {"error": {"message": "not found"}})
+
+        def _read_body(self) -> bytes:
+            """The request body: by Content-Length, or de-chunked when a proxy sends Transfer-Encoding:
+            chunked with no Content-Length (e.g. a relay agent forwarding a tunneled request to this
+            server's local port) - without this, such a body reads as empty: 400 'No messages provided'."""
+            cl = self.headers.get("Content-Length")
+            if cl is not None:
+                try:
+                    n = int(cl)
+                except ValueError:
+                    return b""
+                return self.rfile.read(n) if n > 0 else b""
+            if (self.headers.get("Transfer-Encoding", "") or "").strip().lower() != "chunked":
+                return b""
+            chunks = []
+            while True:
+                line = self.rfile.readline(128)
+                if not line:
+                    break
+                size_str = line.split(b";", 1)[0].strip()
+                try:
+                    size = int(size_str, 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    while True:
+                        trailer = self.rfile.readline()
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.read(2)  # the chunk's trailing CRLF
+            return b"".join(chunks)
 
         def do_POST(self):
             if not self._authorized():
