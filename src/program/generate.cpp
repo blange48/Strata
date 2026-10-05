@@ -6183,7 +6183,11 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < n_pipe; ++k) {
                     StagePoller* sp = spoll[(size_t) k].get();
                     strata::core::Verifier* vk = &stage_verifier(k);
-                    sp->th = std::thread([sp, vk] {
+                    // the stage's thread on the core its slice keeps for it: unpinned, it shared cores with the pinned
+                    // workers and every yield cost a scheduler slice (measured: waitA 1-2 ms -> 66-95 ms per window)
+                    const int own_core = k * (per + 1) + per;
+                    sp->th = std::thread([sp, vk, own_core] {
+                        sp->pool->pin_caller(own_core);
                         for (;;) {
                             {
                                 std::unique_lock<std::mutex> lk(sp->mu);

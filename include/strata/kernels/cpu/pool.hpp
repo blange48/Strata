@@ -145,6 +145,9 @@ public:
     ExpertPool& operator=(const ExpertPool&) = delete;
 
     int workers() const { return n_; }
+    /// --stage-threads: pin the calling thread to worker core `index` of this machine's list (the core a stage's slice
+    /// keeps for its own thread).  false when there is no such core or pinning failed.
+    bool pin_caller(int index) const;
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }

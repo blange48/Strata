@@ -399,6 +399,11 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     }
 }
 
+bool ExpertPool::pin_caller(int index) const {
+    if (index < 0 || index >= (int) topo_.worker_cores.size()) return false;
+    return pin_this_thread(topo_.worker_cores[(size_t) index]);
+}
+
 ExpertPool::~ExpertPool() {
     const ExpertPool* self = this;
     g_diag_pool.compare_exchange_strong(self, nullptr);
