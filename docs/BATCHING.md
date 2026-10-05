@@ -75,6 +75,25 @@ The rules come from a few machines. `--calibrate` measures the candidates (the r
 without pipeline groups) at 1 request (solo path), 2, 4 and all slots, and keeps the
 one with the best mean relative rate; each candidate is an engine start, so it takes several minutes per candidate.
 
+### Measuring them on this machine: `tools/tune.py`
+
+```
+python3 tools/tune.py --config strata-<model>.json            # rules + PCIe share, resident K/V, pipeline groups
+python3 tools/tune.py --config strata-<model>.json --quick    # rules + two PCIe shares
+```
+
+The end-to-end version of the above: every candidate (the rules' config, `--pcie-frac 0.6` / `1.0`, half the
+`--kv-resident`, no `--batch-groups`) is served by `serve/server.py` and measured over HTTP - total tok/s at 1, 4 and
+8 clients, the first token of a fresh 45K-token prompt, the free RAM, and greedy answers compared with the rules'.
+A candidate replaces the rules' config only when it beats it by more than 3 % (`--margin`); the winner must then
+pass `tools/batch_test.py` (and `tools/parking_test.py` with parking on) before it is written to
+`<config>.tuned.json`, with a Markdown report next to it. It needs the GPUs to itself, ~5 minutes per candidate.
+
+The rates depend on the text (the experts it routes to, the MTP drafts accepted): pass your users' kind of prompts
+with `--prompts prompts.json` (a JSON list of strings). On 4 x RTX 5080 (PCIe Gen3) the rules won: a larger PCIe share
+was slower (`--pcie-frac 1.0`: -17 % for one request), without pipeline groups 8 requests fell from 361 to 193 tok/s,
+and half the resident K/V was within the 3 % noise.
+
 ## How the server uses the slots
 
 - **One request alone** runs on the usual solo path (verify windows with MTP drafts): the fastest single stream.
