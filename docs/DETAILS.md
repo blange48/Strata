@@ -632,6 +632,12 @@ print(r.choices[0].message.content)
   `--prefill auto` (8192 tokens), a 42,131 token prompt read in 15 s sent six of them. A prompt shorter than one chunk
   sends nothing, and that is on purpose: its only line arrives once the prompt is read, because the last tokens go
   through the verify windows rather than the batched path, so it stops up to `--short-read` tokens short of the end.
+- **Tool calls the model writes in another form.** A call of a tool the request declared is read as a call also
+  when the model writes it as `<parameter=NAME>` instead of `<function=NAME>`, as JSON (`{"name": ..., "arguments":
+  ...}`) inside `<tool_call>`, as a `<function=NAME>` block at the start of a line without `<tool_call>` (not inside
+  a ``` code block), or as a second call inside the same `<tool_call>`. Anything else in those forms is returned as
+  the text it is; none of them ends the request with an error. Measured on 1,462 agent turns (Qwen3.8 under Claude
+  Code, from signalnine/q27's drift corpus): 98.3% read as intended, before 92.3%, of which 5% had ended the request.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, any API key.
 - **OpenCode** (#543). A starting point for `opencode.jsonc` (in your project, or `~/.config/opencode/`); the field
   names are OpenCode's, so check its config docs if your version differs:
