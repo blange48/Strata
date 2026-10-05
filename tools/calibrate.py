@@ -11,6 +11,12 @@ measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
 The first two are measured through one engine (per-request `strata_tune` keys); the worker count needs a restart
 per value.  Decode speed only: the prompt path streams every expert whatever these settings say.
 
+With batch slots ("parallel": N / --batch), two more settings decide how fast the slots run together, and only a
+load of several requests at once shows them (one request takes the solo path):
+  --batch-groups  with a layer split, the slots in groups pipelined through the GPUs (or all of them in one window).
+  --kv-resident   the K/V cells kept in VRAM per sequence; fewer leave room for more experts in the cache.
+They are measured last, a restart each, as the total tok/s of every slot decoding at once.
+
 A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
 adaptive expert tier and the OS make single measurements noisy by a few percent.
 
@@ -156,6 +162,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
         d_pcie = float(info.get("pcie_frac", 0.55))
         d_minp = float(info.get("spec_min_p", 0.5))
         d_workers = int(info.get("pool_workers", 0)) or None
+        slots = int(getattr(eng, "batch", 0) or info.get("batch_slots", 0) or 0)
         s = Session(eng, ids_list)
         s.warm_up()
         # 1. the PCIe share, at the default draft floor
@@ -210,9 +217,70 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
             base_rate = statistics.median(by_workers[w_best])
         elif by_workers.get(d_workers):
             base_rate = statistics.median(by_workers[d_workers])
+    # 5. with batch slots: the batch settings, with every slot decoding at once (a restart each)
+    if slots > 1:
+        tuned = apply(base_args, settings)
+        p_settings, p_report = measure_parallel(tuned, slots, ids_list, start_engine, say)
+        settings.update(p_settings)
+        report.update(p_report)
     report["seconds"] = round(time.time() - t0)
     report["tok_s"] = round(base_rate, 1) if base_rate else None
     return {"settings": settings, "report": report}
+
+
+def parallel_rate(engine, ids_list, clients: int) -> float:
+    """Total decode tok/s with `clients` requests at once: the engine runs them together in its batch slots."""
+    counts = [0] * clients
+
+    def one(i):
+        ids = ids_list[i % len(ids_list)]
+        counts[i] = sum(1 for t in engine.generate(ids, MAX_NEW, {"temperature": 0}, threading.Event()) if t is not None)
+
+    t0 = time.time()
+    th = [threading.Thread(target=one, args=(i,)) for i in range(clients)]
+    for x in th:
+        x.start()
+    for x in th:
+        x.join()
+    return sum(counts) / max(time.time() - t0, 1e-9)
+
+
+def parallel_candidates(args: list[str]) -> dict:
+    """The batch settings worth a restart each, from the config as it runs: name -> args."""
+    out = {"as configured": list(args)}
+    groups = arg_value(args, "--batch-groups")
+    if groups and int(groups) > 1:
+        out["no --batch-groups"] = with_arg(args, "--batch-groups", None)
+    kvres = arg_value(args, "--kv-resident")
+    if kvres and int(kvres) > 1:
+        out[f"--kv-resident {int(kvres) // 2}"] = with_arg(args, "--kv-resident", str(int(kvres) // 2))
+    return out
+
+
+def measure_parallel(tuned_args: list[str], slots: int, ids_list, start_engine, say=print) -> tuple[dict, dict]:
+    """Step 5: every batch setting (a restart each) with all the slots decoding at once; -> (settings, report)."""
+    cands = parallel_candidates(tuned_args)
+    if len(cands) < 2:
+        return {}, {}
+    by = {k: [] for k in cands}
+    for _ in range(2):                                 # interleaved: two rounds over every candidate
+        for name, args in cands.items():
+            say(f"  Measuring {slots} requests at once, {name} (restarts the engine) ...")
+            e = start_engine(args)
+            try:
+                parallel_rate(e, ids_list, slots)      # warm-up: the slots' first windows and the expert tier
+                by[name].append(parallel_rate(e, ids_list, slots))
+            finally:
+                close(e)
+            say(f"    {slots} at once, {name}: {by[name][-1]:.1f} tok/s")
+    best = pick(by, "as configured")
+    settings = {}
+    if best != "as configured":
+        a = cands[best]
+        for flag in ("--batch-groups", "--kv-resident"):
+            if arg_value(a, flag) != arg_value(tuned_args, flag):
+                settings[flag] = arg_value(a, flag)
+    return settings, {"slots": slots, "parallel": {k: [round(x, 1) for x in v] for k, v in by.items()}}
 
 
 def close(eng):
@@ -229,6 +297,7 @@ def close(eng):
 
 
 DEFAULTS = {"--pcie-frac": None, "--spec-min-p": "0.5", "--pool-workers": None}   # None: the engine's own choice
+BATCH_FLAGS = ("--batch-groups", "--kv-resident")   # step 5: changed only when a calibration measured them better
 
 
 def apply(args: list[str], settings: dict) -> list[str]:
@@ -238,6 +307,9 @@ def apply(args: list[str], settings: dict) -> list[str]:
     out = list(args)
     for flag, default in DEFAULTS.items():
         out = with_arg(out, flag, settings.get(flag, default))
+    for flag in BATCH_FLAGS:                             # the batch settings: as calibrated (None: without the flag)
+        if flag in settings:
+            out = with_arg(out, flag, settings[flag])
     return out
 
 

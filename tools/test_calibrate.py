@@ -42,6 +42,26 @@ class FakeEngine:
 
 
 BASE = ["--pack", "p", "--spec", "4", "--spec-min-p", "0.5", "--max-context", "8192"]
+BATCH = BASE + ["--batch", "8", "--batch-groups", "4", "--kv-resident", "32768"]
+
+
+class FakeBatchEngine(FakeEngine):
+    """With batch slots: requests at once share the throughput `batch_speed(args)` (tok/s for all of them)."""
+
+    def __init__(self, args, speed, batch_speed, starts=None):
+        super().__init__(args, speed, 6, starts)
+        self.batch = int(CAL.arg_value(args, "--batch") or 0)
+        self.batch_speed = batch_speed(args)
+        self.lock = __import__("threading").Lock()
+
+    def generate(self, ids, max_new, sampling, cancel):
+        if sampling.get("strata_tune"):
+            yield from super().generate(ids, max_new, sampling, cancel)
+            return
+        import time as _t
+        _t.sleep(max_new * self.batch / self.batch_speed)   # each of the `batch` requests gets batch_speed / batch
+        for _ in range(max_new):
+            yield 1
 
 
 class Calibrate(unittest.TestCase):
@@ -81,6 +101,37 @@ class Calibrate(unittest.TestCase):
         self.assertIsNone(CAL.arg_value(starts[0], "--pcie-frac"))
         self.assertIsNone(CAL.arg_value(starts[0], "--pool-workers"))
         self.assertEqual(CAL.arg_value(starts[0], "--spec-min-p"), "0.5")
+
+    def run_batch(self, batch_speed):
+        starts = []
+        with mock.patch.object(CAL, "MAX_NEW", 40):
+            res = CAL.measure(BATCH, [[1, 2, 3]] * 3, lambda a: FakeBatchEngine(a, lambda f, p, w: 50.0, batch_speed, starts),
+                              say=lambda *_: None)
+        return res, starts
+
+    def test_parallel_step_keeps_the_config_when_flat(self):
+        res, starts = self.run_batch(lambda a: 400.0)
+        self.assertEqual(res["settings"], {})
+        self.assertEqual(res["report"]["slots"], 8)
+        self.assertEqual(set(res["report"]["parallel"]), {"as configured", "no --batch-groups", "--kv-resident 16384"})
+        # the sweep, one start per worker count, then two interleaved rounds of the three batch candidates
+        self.assertEqual(len(starts), 1 + len(CAL.worker_candidates(6)) + 2 * 3)
+
+    def test_parallel_step_finds_a_smaller_resident_kv(self):
+        res, _ = self.run_batch(lambda a: 500.0 if CAL.arg_value(a, "--kv-resident") == "16384" else 400.0)
+        self.assertEqual(res["settings"], {"--kv-resident": "16384"})
+        a = CAL.apply(BATCH, res["settings"])
+        self.assertEqual(CAL.arg_value(a, "--kv-resident"), "16384")
+        self.assertEqual(CAL.arg_value(a, "--batch-groups"), "4")
+
+    def test_parallel_step_can_drop_the_groups(self):
+        res, _ = self.run_batch(lambda a: 500.0 if "--batch-groups" not in a else 400.0)
+        self.assertEqual(res["settings"], {"--batch-groups": None})
+        self.assertNotIn("--batch-groups", CAL.apply(BATCH, res["settings"]))
+
+    def test_no_parallel_step_without_slots(self):
+        res, starts = self.run_with(lambda f, p, w: 50.0)
+        self.assertNotIn("parallel", res["report"])
 
     def test_apply(self):
         a = CAL.apply(BASE, {"--pcie-frac": "0.35", "--pool-workers": "4"})
