@@ -368,7 +368,7 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int first_core)
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity)
     : host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
@@ -390,8 +390,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     split_multi_.resize((size_t) kMaxSplitMulti);
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
-        const int ci = (std::max)(0, first_core) + i;
-        const int core = pin ? (ci < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) ci] : -1) : -1;
+        const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
         threads_.emplace_back([this, i, core] {
             pin_this_thread(core, i);
             worker(i);
