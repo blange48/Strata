@@ -6134,7 +6134,7 @@ int main(int argc, char** argv) {
             const char* why = peer.valid() ? "--peer-device"
                             : drive.d.remote_count > 0 ? "--expert-cache-remote"
                             : drive.d.lookahead != nullptr ? "the router lookahead"
-                            : (srcp == &src && src.staged()) ? "a staged expert file tier"
+                            : (srcp == &src && (src.gguf_mode() || src.unbuffered())) ? "a staged expert file tier"
                             : drive.routing != nullptr ? "--dump-routing" : nullptr;
             if (why != nullptr) {
                 std::fprintf(stderr, "strata serve: --stage-threads is not used with %s: one thread serves the stages\n", why);
